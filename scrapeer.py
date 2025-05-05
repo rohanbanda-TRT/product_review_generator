@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Amazon Product Automated Content Review
+Amazon Product Content Generation System
 ----------------------------------
-A script to scrape Amazon product details and automatically generate content reviews.
+A script to scrape Amazon product details and generate content using OpenAI.
 
 Usage:
-    python scrapeer.py <amazon_product_url> [--output filename.json] [--review-type detailed|summary|comparison] [--generate-image] [--image-output-dir directory] [--generate-video] [--video-duration seconds] [--with-voiceover]
-
-Example:
-    python scrapeer.py https://www.amazon.com/dp/B07PXGQC1Q --output product_review.json --review-type detailed --generate-image --image-output-dir images --generate-video --video-duration 90 --with-voiceover
+    python scrapeer.py <amazon_product_url> [--output filename.json]
 """
 
 import requests
@@ -26,17 +23,33 @@ from dotenv import load_dotenv
 import base64
 from PIL import Image
 from io import BytesIO
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import numpy as np
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-import matplotlib.patches as patches
+import uuid
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("scrapeer.log")
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import the more reliable scraping function from bs4scrape.py
+from bs4scrape import get_amazon_product_details as bs4_get_amazon_product_details
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Check if OpenAI API key is set in environment variables
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OpenAI API key not found. Please set it in your .env file.")
+
+openai.api_key = OPENAI_API_KEY
+
 
 def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
     """
@@ -46,7 +59,7 @@ def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
         url (str): Amazon product URL
         
     Returns:
-        dict: Product details including title, price, description, features, and reviews
+        dict: Product details including title, price, description, features, and images
     """
     # List of user agents to rotate
     user_agents = [
@@ -54,7 +67,6 @@ def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0',
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1'
     ]
     
     # Headers to mimic a browser visit
@@ -91,7 +103,6 @@ def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
             "specifications": {},
             "rating": None,
             "review_count": None,
-            "top_reviews": [],
             "image_urls": [],
             "availability": None,
             "seller": None,
@@ -108,65 +119,49 @@ def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
         # Extract product price
         price_whole = soup.select_one('.a-price-whole')
         price_fraction = soup.select_one('.a-price-fraction')
-        currency_symbol = soup.select_one('.a-price-symbol')
-        
         if price_whole and price_fraction:
             product_details["price"] = f"{price_whole.text.strip()}{price_fraction.text.strip()}"
-            if currency_symbol:
-                product_details["currency"] = currency_symbol.text.strip()
+            product_details["currency"] = soup.select_one('.a-price-symbol').text.strip() if soup.select_one('.a-price-symbol') else "$"
         else:
-            # Alternative price selectors
-            price_element = soup.select_one('.a-price .a-offscreen')
+            price_element = soup.select_one('.a-offscreen')
             if price_element:
                 price_text = price_element.text.strip()
                 # Extract currency symbol
-                currency_match = re.search(r'^(\D+)', price_text)
+                currency_match = re.search(r'[^\d\.,]+', price_text)
                 if currency_match:
-                    product_details["currency"] = currency_match.group(1)
-                # Extract price
-                price_match = re.search(r'[\d,.]+', price_text)
+                    product_details["currency"] = currency_match.group(0).strip()
+                # Extract price value
+                price_match = re.search(r'[\d\.,]+', price_text)
                 if price_match:
-                    product_details["price"] = price_match.group(0)
+                    product_details["price"] = price_match.group(0).strip()
         
         # Extract product description
         description_element = soup.select_one('#productDescription')
         if description_element:
             product_details["description"] = description_element.text.strip()
-        else:
-            # Alternative description selectors
-            alt_desc = soup.select_one('#feature-bullets')
-            if alt_desc:
-                product_details["description"] = alt_desc.text.strip()
         
         # Extract product features
-        feature_bullets = soup.select('#feature-bullets ul li')
-        for bullet in feature_bullets:
-            # Skip promotional elements
-            if 'promotions_feature_div' not in bullet.get('id', ''):
-                feature_text = bullet.text.strip()
-                if feature_text:
-                    product_details["features"].append(feature_text)
+        feature_elements = soup.select('#feature-bullets ul li:not(.aok-hidden) span.a-list-item')
+        if feature_elements:
+            product_details["features"] = [feature.text.strip() for feature in feature_elements]
         
         # Extract product specifications
-        spec_tables = soup.select('.prodDetTable')
-        for table in spec_tables:
-            rows = table.select('tr')
-            for row in rows:
-                header = row.select_one('th')
-                value = row.select_one('td')
-                if header and value:
-                    header_text = header.text.strip().rstrip(':')
-                    value_text = value.text.strip()
-                    if header_text and value_text:
-                        product_details["specifications"][header_text] = value_text
+        spec_elements = soup.select('#productDetails_techSpec_section_1 tr, #productDetails_detailBullets_sections1 tr')
+        for spec in spec_elements:
+            key_element = spec.select_one('th, .prodDetSectionEntry')
+            value_element = spec.select_one('td, .prodDetAttrValue')
+            if key_element and value_element:
+                key = key_element.text.strip().rstrip(':')
+                value = value_element.text.strip()
+                product_details["specifications"][key] = value
         
-        # Extract rating
+        # Extract product rating
         rating_element = soup.select_one('#acrPopover')
         if rating_element and 'title' in rating_element.attrs:
             rating_text = rating_element['title']
-            rating_match = re.search(r'([\d.]+)', rating_text)
+            rating_match = re.search(r'([\d\.]+)', rating_text)
             if rating_match:
-                product_details["rating"] = rating_match.group(1)
+                product_details["rating"] = float(rating_match.group(1))
         
         # Extract review count
         review_count_element = soup.select_one('#acrCustomerReviewText')
@@ -174,321 +169,53 @@ def fetch_amazon_product_details(url: str) -> Dict[str, Any]:
             count_text = review_count_element.text.strip()
             count_match = re.search(r'([\d,]+)', count_text)
             if count_match:
-                product_details["review_count"] = count_match.group(1).replace(',', '')
+                product_details["review_count"] = int(count_match.group(1).replace(',', ''))
         
-        # Extract top reviews
-        reviews = soup.select('#cm-cr-dp-review-list .review')
-        for review in reviews[:5]:  # Get top 5 reviews
-            review_data = {
-                "rating": None,
-                "title": None,
-                "author": None,
-                "date": None,
-                "text": None,
-                "verified": False
-            }
-            
-            # Review rating
-            rating_element = review.select_one('.review-rating')
-            if rating_element:
-                rating_text = rating_element.text.strip()
-                rating_match = re.search(r'([\d.]+)', rating_text)
-                if rating_match:
-                    review_data["rating"] = rating_match.group(1)
-            
-            # Review title
-            title_element = review.select_one('.review-title')
-            if title_element:
-                review_data["title"] = title_element.text.strip()
-            
-            # Review author
-            author_element = review.select_one('.a-profile-name')
-            if author_element:
-                review_data["author"] = author_element.text.strip()
-            
-            # Review date
-            date_element = review.select_one('.review-date')
-            if date_element:
-                review_data["date"] = date_element.text.strip()
-            
-            # Review text
-            text_element = review.select_one('.review-text')
-            if text_element:
-                review_data["text"] = text_element.text.strip()
-            
-            # Verified purchase
-            verified_element = review.select_one('.a-color-state')
-            if verified_element and 'verified purchase' in verified_element.text.lower():
-                review_data["verified"] = True
-            
-            product_details["top_reviews"].append(review_data)
-        
-        # Extract image URLs
+        # Extract product images
+        # Try to get from image gallery first
         image_gallery = soup.select('#altImages .item')
-        for item in image_gallery:
-            img = item.select_one('img')
-            if img and 'src' in img.attrs:
-                img_url = img['src']
+        for img_item in image_gallery:
+            img_element = img_item.select_one('img')
+            if img_element and 'src' in img_element.attrs:
+                img_url = img_element['src']
                 # Convert thumbnail URL to full-size image URL
-                img_url = re.sub(r'\._.*_\.', '.', img_url)
-                product_details["image_urls"].append(img_url)
+                full_img_url = re.sub(r'\._.*_\.', '.', img_url)
+                if full_img_url not in product_details["image_urls"]:
+                    product_details["image_urls"].append(full_img_url)
         
-        # Extract availability
+        # If no images found in gallery, try main product image
+        if not product_details["image_urls"]:
+            main_img = soup.select_one('#landingImage, #imgBlkFront')
+            if main_img and 'data-old-hires' in main_img.attrs:
+                product_details["image_urls"].append(main_img['data-old-hires'])
+            elif main_img and 'src' in main_img.attrs:
+                product_details["image_urls"].append(main_img['src'])
+        
+        # Extract product availability
         availability_element = soup.select_one('#availability')
         if availability_element:
             product_details["availability"] = availability_element.text.strip()
         
-        # Extract seller
+        # Extract seller information
         seller_element = soup.select_one('#merchant-info')
         if seller_element:
             product_details["seller"] = seller_element.text.strip()
         
-        # Extract brand
+        # Extract brand information
         brand_element = soup.select_one('#bylineInfo')
         if brand_element:
-            brand_text = brand_element.text.strip()
-            brand_match = re.search(r'by\s+(.+)', brand_text, re.IGNORECASE)
-            if brand_match:
-                product_details["brand"] = brand_match.group(1).strip()
+            product_details["brand"] = brand_element.text.strip()
         
-        # Extract categories
-        breadcrumbs = soup.select('#wayfinding-breadcrumbs_feature_div ul li')
-        for crumb in breadcrumbs:
-            link = crumb.select_one('a')
-            if link:
-                category = link.text.strip()
-                if category:
-                    product_details["categories"].append(category)
+        # Extract category information
+        category_elements = soup.select('#wayfinding-breadcrumbs_feature_div ul li')
+        if category_elements:
+            product_details["categories"] = [category.text.strip() for category in category_elements if category.text.strip()]
         
         return product_details
-    
+        
     except Exception as e:
-        return {"error": f"An error occurred: {str(e)}"}
+        return {"error": f"Error fetching product details: {str(e)}"}
 
-def generate_product_review(product_details: Dict[str, Any], review_type: str = "detailed") -> Dict[str, Any]:
-    """
-    Generate an automated review for a product based on its details
-    
-    Args:
-        product_details (dict): Product details dictionary
-        review_type (str): Type of review to generate (detailed, summary, comparison)
-        
-    Returns:
-        dict: Generated review content
-    """
-    if "error" in product_details:
-        return {"error": product_details["error"]}
-    
-    # Prepare review data structure
-    review = {
-        "product_title": product_details.get("title", "Unknown Product"),
-        "review_type": review_type,
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "content": {}
-    }
-    
-    # Check if we have OpenAI API key for AI-generated content
-    if OPENAI_API_KEY:
-        try:
-            print(f"Generating {review_type} review using AI...")
-            review["content"] = generate_ai_review(product_details, review_type)
-        except Exception as e:
-            print(f"Error generating AI review: {str(e)}")
-            # Fall back to template-based review
-            review["content"] = generate_template_review(product_details, review_type)
-    else:
-        print("No OpenAI API key found. Using template-based review generation.")
-        review["content"] = generate_template_review(product_details, review_type)
-    
-    return review
-
-def generate_ai_review(product_details: Dict[str, Any], review_type: str) -> Dict[str, str]:
-    """
-    Generate a review using OpenAI's API
-    
-    Args:
-        product_details (dict): Product details dictionary
-        review_type (str): Type of review to generate
-        
-    Returns:
-        dict: Generated review content sections
-    """
-    # Configure OpenAI client
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    
-    # Prepare product information for the prompt
-    product_info = f"Product: {product_details.get('title', 'Unknown Product')}\n"
-    product_info += f"Brand: {product_details.get('brand', 'Unknown')}\n"
-    product_info += f"Price: {product_details.get('currency', '$')}{product_details.get('price', 'N/A')}\n"
-    product_info += f"Rating: {product_details.get('rating', 'N/A')}/5 from {product_details.get('review_count', 'N/A')} reviews\n"
-    
-    if product_details.get("description"):
-        product_info += f"\nDescription: {product_details['description']}\n"
-    
-    if product_details.get("features"):
-        product_info += "\nFeatures:\n"
-        for feature in product_details["features"]:
-            product_info += f"- {feature}\n"
-    
-    if product_details.get("specifications"):
-        product_info += "\nSpecifications:\n"
-        for key, value in product_details["specifications"].items():
-            product_info += f"- {key}: {value}\n"
-    
-    if product_details.get("top_reviews"):
-        product_info += "\nCustomer Reviews:\n"
-        for i, review in enumerate(product_details["top_reviews"][:3], 1):
-            product_info += f"Review {i}: {review.get('rating', 'N/A')}/5 - {review.get('title', 'N/A')}\n"
-            product_info += f"{review.get('text', 'N/A')}\n\n"
-    
-    # Define prompts based on review type
-    if review_type == "detailed":
-        prompt = f"You are a professional product reviewer. Create a detailed, comprehensive review for the following Amazon product:\n\n{product_info}\n\nYour review should include:\n1. An engaging introduction\n2. Pros and cons analysis\n3. Feature evaluation\n4. Value for money assessment\n5. Comparison with similar products (if information available)\n6. Final verdict with rating out of 10\n7. Recommendation for who should buy this product"
-    
-    elif review_type == "summary":
-        prompt = f"You are a concise product reviewer. Create a brief, informative summary review for the following Amazon product:\n\n{product_info}\n\nYour review should include:\n1. A short introduction\n2. Key highlights (3-5 points)\n3. Main drawbacks (if any)\n4. Quick verdict with rating out of 10"
-    
-    elif review_type == "comparison":
-        prompt = f"You are a comparative product analyst. Create a review that positions this product in the market context:\n\n{product_info}\n\nYour review should include:\n1. Market positioning\n2. Competitive advantages and disadvantages\n3. Value proposition analysis\n4. Alternative recommendations for different user needs\n5. Final verdict on who should choose this product over alternatives"
-    
-    else:  # Default to balanced review
-        prompt = f"You are a balanced product reviewer. Create a fair, unbiased review for the following Amazon product:\n\n{product_info}\n\nYour review should include:\n1. Product overview\n2. Equal coverage of strengths and weaknesses\n3. Practical use cases\n4. Value assessment\n5. Final recommendation with rating out of 10"
-    
-    # Make API call to OpenAI
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are an expert product reviewer who writes engaging, informative, and honest reviews."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7,
-        max_tokens=1500
-    )
-    
-    # Process the response
-    review_text = response.choices[0].message.content
-    
-    # Parse the review into sections
-    sections = {}
-    
-    # Extract introduction (first paragraph)
-    intro_match = re.search(r'^(.+?)\n\n', review_text, re.DOTALL)
-    if intro_match:
-        sections["introduction"] = intro_match.group(1).strip()
-    
-    # Extract pros and cons if present
-    pros_match = re.search(r'(?:Pros|PROS|Advantages|Strengths):\s*(.+?)(?:\n\n|\n(?:Cons|CONS|Disadvantages|Weaknesses):)', review_text, re.DOTALL)
-    if pros_match:
-        sections["pros"] = pros_match.group(1).strip()
-    
-    cons_match = re.search(r'(?:Cons|CONS|Disadvantages|Weaknesses):\s*(.+?)\n\n', review_text, re.DOTALL)
-    if cons_match:
-        sections["cons"] = cons_match.group(1).strip()
-    
-    # Extract verdict/conclusion (usually last paragraph)
-    verdict_match = re.search(r'(?:Verdict|Conclusion|Final Thoughts|Bottom Line|Summary):\s*(.+?)$', review_text, re.DOTALL)
-    if verdict_match:
-        sections["verdict"] = verdict_match.group(1).strip()
-    else:
-        # If no explicit verdict section, use the last paragraph
-        paragraphs = review_text.split('\n\n')
-        if paragraphs:
-            sections["verdict"] = paragraphs[-1].strip()
-    
-    # Extract rating if present
-    rating_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:out of|\/)\s*10', review_text)
-    if rating_match:
-        sections["rating"] = rating_match.group(1)
-    
-    # Include the full review text
-    sections["full_text"] = review_text
-    
-    return sections
-
-def generate_template_review(product_details: Dict[str, Any], review_type: str) -> Dict[str, str]:
-    """
-    Generate a review using templates
-    
-    Args:
-        product_details (dict): Product details dictionary
-        review_type (str): Type of review to generate
-        
-    Returns:
-        dict: Generated review content sections
-    """
-    review_content = {}
-    
-    # Get product information
-    title = product_details.get("title", "this product")
-    brand = product_details.get("brand", "the manufacturer")
-    price = product_details.get("price", "N/A")
-    currency = product_details.get("currency", "$")
-    rating = product_details.get("rating", "N/A")
-    features = product_details.get("features", [])
-    
-    # Generate introduction
-    intro_templates = [
-        f"The {title} by {brand} is a product that has gained attention in the market.",
-        f"We recently had the opportunity to evaluate the {title} from {brand}.",
-        f"In today's review, we'll be taking a close look at the {title}, a product from {brand}."
-    ]
-    review_content["introduction"] = random.choice(intro_templates)
-    
-    # Generate pros
-    pros = []
-    if features:
-        # Use some features as pros
-        for feature in features[:min(3, len(features))]:
-            pros.append(feature)
-    
-    if float(rating) >= 4.0 if rating != "N/A" else False:
-        pros.append(f"High customer satisfaction with an average rating of {rating}/5")
-    
-    if not pros:
-        pros = ["Appears to meet basic functionality requirements", "Available for purchase online"]
-    
-    review_content["pros"] = "\n- " + "\n- ".join(pros)
-    
-    # Generate cons
-    cons = []
-    if float(rating) < 4.0 if rating != "N/A" else False:
-        cons.append(f"Customer ratings indicate room for improvement with an average of {rating}/5")
-    
-    if not cons:
-        cons = ["Limited information available for comprehensive assessment", "May not meet all specialized requirements"]
-    
-    review_content["cons"] = "\n- " + "\n- ".join(cons)
-    
-    # Generate verdict
-    if review_type == "detailed":
-        verdict_template = f"After thorough evaluation, the {title} offers {len(pros)} notable advantages including {pros[0].lower() if pros else 'basic functionality'}. However, potential buyers should consider {cons[0].lower() if cons else 'their specific needs before purchasing'}. Overall, it represents a {random.choice(['reasonable', 'considerable', 'noteworthy'])} option in its category."
-    elif review_type == "summary":
-        verdict_template = f"In summary, the {title} is a {random.choice(['suitable', 'functional', 'practical'])} product with some {random.choice(['strengths', 'benefits', 'advantages'])} that may meet the needs of certain users."
-    else:  # comparison or default
-        verdict_template = f"Compared to alternatives in the market, the {title} positions itself as a {random.choice(['contender', 'option', 'alternative'])} worth considering for those who prioritize {pros[0].lower() if pros else 'the features it offers'}."
-    
-    review_content["verdict"] = verdict_template
-    
-    # Generate rating
-    if rating != "N/A":
-        # Convert 5-star rating to 10-point scale
-        rating_10pt = float(rating) * 2
-        # Add some randomness but keep it reasonable based on original rating
-        rating_10pt = max(1, min(10, rating_10pt + random.uniform(-0.5, 0.5)))
-        review_content["rating"] = f"{rating_10pt:.1f}"
-    else:
-        review_content["rating"] = f"{random.uniform(5.0, 8.0):.1f}"
-    
-    # Combine all sections for full text
-    full_text = review_content["introduction"] + "\n\n"
-    full_text += "Pros:\n" + review_content["pros"] + "\n\n"
-    full_text += "Cons:\n" + review_content["cons"] + "\n\n"
-    full_text += "Verdict:\n" + review_content["verdict"] + "\n\n"
-    full_text += f"Rating: {review_content['rating']}/10"
-    
-    review_content["full_text"] = full_text
-    
-    return review_content
 
 def download_image(url: str) -> Optional[Image.Image]:
     """
@@ -501,507 +228,98 @@ def download_image(url: str) -> Optional[Image.Image]:
         Optional[Image.Image]: PIL Image object or None if download failed
     """
     try:
-        response = requests.get(url, stream=True, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, stream=True, timeout=10)
         if response.status_code == 200:
             return Image.open(BytesIO(response.content))
-        else:
-            print(f"Failed to download image: HTTP {response.status_code}")
-            return None
+        return None
     except Exception as e:
         print(f"Error downloading image: {str(e)}")
         return None
 
-def analyze_image_with_ai(image: Image.Image, product_details: Dict[str, Any]) -> Dict[str, Any]:
+
+def encode_image_to_base64(image_path: str) -> Optional[str]:
     """
-    Analyze product image using OpenAI's vision capabilities
+    Encode an image to base64 string
     
     Args:
-        image (Image.Image): PIL Image object
-        product_details (Dict[str, Any]): Product details
+        image_path (str): Path to the image or URL
         
     Returns:
-        Dict[str, Any]: Analysis results with feature annotations
+        Optional[str]: Base64 encoded string or None if encoding failed
     """
-    # Convert image to base64
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    
-    # Prepare product information for context
-    product_info = f"Product: {product_details.get('title', 'Unknown Product')}\n"
-    product_info += f"Brand: {product_details.get('brand', 'Unknown')}\n"
-    
-    if product_details.get("features"):
-        product_info += "\nFeatures:\n"
-        for feature in product_details["features"][:5]:  # Limit to top 5 features
-            product_info += f"- {feature}\n"
-    
-    if product_details.get("specifications"):
-        product_info += "\nSpecifications:\n"
-        for key, value in list(product_details["specifications"].items())[:5]:  # Limit to top 5 specs
-            product_info += f"- {key}: {value}\n"
-    
-    # Configure OpenAI client
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    
-    # Create prompt for image analysis
-    prompt = f"""You are an expert product analyst. Analyze this product image and identify key visual features that should be highlighted.
-
-Product Information:
-{product_info}
-
-For this image:
-1. Identify 3-5 key visual features worth highlighting (e.g., screen size for a laptop, camera setup for a phone)
-2. For each feature, provide:
-   - A short name (1-3 words)
-   - A brief description (5-15 words)
-   - The approximate location in the image (top-left, center, bottom-right, etc.)
-   - A confidence score (0-100%)
-
-Format your response as a JSON object with an array of features.
-"""
-    
     try:
-        # Make API call to OpenAI with vision capabilities
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Using GPT-4o which has vision capabilities
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}
-                        }
-                    ]
-                }
-            ],
-            max_tokens=1000
-        )
-        
-        # Extract and parse the response
-        analysis_text = response.choices[0].message.content
-        
-        # Try to extract JSON from the response
-        try:
-            # Find JSON object in the response
-            json_match = re.search(r'\{[\s\S]*\}', analysis_text)
-            if json_match:
-                analysis_json = json.loads(json_match.group(0))
-                return analysis_json
+        if image_path.startswith('http'):
+            response = requests.get(image_path, stream=True)
+            if response.status_code == 200:
+                image_data = response.content
             else:
-                # If no JSON found, create a structured response
-                return {"features": [{"name": "Product Overview", "description": "Key product features and specifications", "location": "center", "confidence": 90}]}
-        except json.JSONDecodeError:
-            # If JSON parsing fails, create a structured response
-            return {"features": [{"name": "Product Overview", "description": "Key product features and specifications", "location": "center", "confidence": 90}]}
-    
-    except Exception as e:
-        print(f"Error analyzing image with AI: {str(e)}")
-        # Return a default analysis
-        return {"features": [{"name": "Product Overview", "description": "Key product features and specifications", "location": "center", "confidence": 90}]}
-
-def process_product_images(product_details: Dict[str, Any], output_dir: str = "output") -> List[str]:
-    """
-    Process product images to generate multiple annotated feature highlights
-    
-    Args:
-        product_details (Dict[str, Any]): Product details including image URLs
-        output_dir (str): Directory to save generated images
-        
-    Returns:
-        List[str]: Paths to the generated images
-    """
-    if not product_details.get("image_urls"):
-        print("No product images found")
-        return []
-    
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get product title for filenames
-    product_title = product_details.get("title", "product")
-    safe_title = re.sub(r'[^\w\s-]', '', product_title)
-    safe_title = re.sub(r'[-\s]+', '-', safe_title).strip('-').lower()
-    
-    # List to store paths of generated images
-    generated_image_paths = []
-    
-    # Process up to 3 product images if available
-    image_urls = product_details["image_urls"][:min(3, len(product_details["image_urls"]))]
-    
-    for i, image_url in enumerate(image_urls):
-        print(f"Processing image {i+1}/{len(image_urls)}: {image_url}")
-        
-        # Download the image
-        image = download_image(image_url)
-        if not image:
-            print(f"Failed to download product image: {image_url}")
-            continue
-        
-        # Analyze the image with AI
-        print(f"Analyzing image {i+1} with AI...")
-        analysis = analyze_image_with_ai(image, product_details)
-        
-        # Generate annotated image
-        print(f"Generating annotated image {i+1}...")
-        annotated_image_path = generate_annotated_image(image, analysis, product_details, output_dir, i+1)
-        
-        if annotated_image_path:
-            generated_image_paths.append(annotated_image_path)
-            
-            # Generate a realistic review scene for this image
-            print(f"Creating realistic review scene for image {i+1}...")
-            scene_image_path = generate_review_scene(image, product_details, output_dir, i+1)
-            if scene_image_path:
-                generated_image_paths.append(scene_image_path)
-    
-    return generated_image_paths
-
-def generate_annotated_image(image: Image.Image, analysis: Dict[str, Any], product_details: Dict[str, Any], output_path: str, image_index: int = 1) -> Optional[str]:
-    """
-    Generate an annotated image highlighting product features
-    
-    Args:
-        image (Image.Image): Original product image
-        analysis (Dict[str, Any]): Image analysis results
-        product_details (Dict[str, Any]): Product details
-        output_path (str): Directory to save the generated image
-        image_index (int): Index of the image being processed
-        
-    Returns:
-        Optional[str]: Path to the generated image or None if generation failed
-    """
-    try:
-        # Create a larger figure to accommodate annotations without overlapping
-        fig, ax = plt.subplots(figsize=(16, 12))
-        
-        # Convert PIL Image to numpy array for matplotlib
-        img_array = np.array(image)
-        
-        # Get image dimensions
-        img_height, img_width = img_array.shape[:2]
-        
-        # Create a larger canvas with padding around the image
-        # This ensures annotations don't overlap with the image
-        canvas_width = img_width * 1.5
-        canvas_height = img_height * 1.5
-        
-        # Center the image on the canvas
-        x_offset = (canvas_width - img_width) / 2
-        y_offset = (canvas_height - img_height) / 2
-        
-        # Set the axis limits to create padding around the image
-        ax.set_xlim(0, canvas_width)
-        ax.set_ylim(canvas_height, 0)  # Inverted y-axis for image coordinates
-        
-        # Display the image centered on the canvas
-        ax.imshow(img_array, extent=[x_offset, x_offset + img_width, y_offset + img_height, y_offset])
-        ax.axis('off')  # Hide axes
-        
-        # Add title with product name
-        product_title = product_details.get("title", "Product Features")
-        plt.title(product_title, fontsize=14, fontweight='bold', pad=20)
-        
-        # Define annotation positions based on location strings
-        # These are now positioned outside the image boundaries
-        location_map = {
-            "top-left": (x_offset * 0.5, y_offset * 0.5),
-            "top": (x_offset + img_width/2, y_offset * 0.5),
-            "top-right": (x_offset + img_width + x_offset * 0.5, y_offset * 0.5),
-            "left": (x_offset * 0.5, y_offset + img_height/2),
-            "center": (x_offset + img_width/2, y_offset + img_height/2),
-            "right": (x_offset + img_width + x_offset * 0.5, y_offset + img_height/2),
-            "bottom-left": (x_offset * 0.5, y_offset + img_height + y_offset * 0.5),
-            "bottom": (x_offset + img_width/2, y_offset + img_height + y_offset * 0.5),
-            "bottom-right": (x_offset + img_width + x_offset * 0.5, y_offset + img_height + y_offset * 0.5)
-        }
-        
-        # Add annotations for each feature
-        features = analysis.get("features", [])
-        colors = ['#FF5733', '#33FF57', '#3357FF', '#F3FF33', '#FF33F3']  # Different colors for annotations
-        
-        for i, feature in enumerate(features):
-            # Get feature details
-            name = feature.get("name", f"Feature {i+1}")
-            description = feature.get("description", "")
-            location_str = feature.get("location", "center").lower()
-            confidence = feature.get("confidence", 90)
-            
-            # Find the closest predefined location
-            closest_location = "center"
-            for loc in location_map.keys():
-                if loc in location_str:
-                    closest_location = loc
-                    break
-            
-            # Get position based on location string
-            annotation_x, annotation_y = location_map.get(closest_location, location_map["center"])
-            
-            # Calculate a point on the image to point to (based on the location)
-            if "top" in closest_location and "left" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.25, y_offset + img_height * 0.25
-            elif "top" in closest_location and "right" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.75, y_offset + img_height * 0.25
-            elif "bottom" in closest_location and "left" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.25, y_offset + img_height * 0.75
-            elif "bottom" in closest_location and "right" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.75, y_offset + img_height * 0.75
-            elif "top" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.5, y_offset + img_height * 0.25
-            elif "bottom" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.5, y_offset + img_height * 0.75
-            elif "left" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.25, y_offset + img_height * 0.5
-            elif "right" in closest_location:
-                point_x, point_y = x_offset + img_width * 0.75, y_offset + img_height * 0.5
-            else:  # center
-                point_x, point_y = x_offset + img_width * 0.5, y_offset + img_height * 0.5
-            
-            # Choose color for this annotation
-            color = colors[i % len(colors)]
-            
-            # Add text annotation outside the image
-            ax.text(
-                annotation_x, annotation_y,
-                f"{name}\n{description}",
-                color='black',
-                fontsize=12,
-                ha='center',
-                va='center',
-                bbox=dict(facecolor='white', edgecolor=color, alpha=0.9, boxstyle='round,pad=0.5', linewidth=2)
-            )
-            
-            # Add arrow pointing to the feature
-            ax.annotate(
-                "",
-                xy=(point_x, point_y),  # Point on the image
-                xytext=(annotation_x, annotation_y),  # Text position
-                arrowprops=dict(arrowstyle="->", color=color, lw=2, connectionstyle="arc3,rad=0.2"),
-            )
-        
-        # Generate filename based on product title and image index
-        safe_title = re.sub(r'[^\w\s-]', '', product_details.get("title", "product"))
-        safe_title = re.sub(r'[-\s]+', '-', safe_title).strip('-').lower()
-        filename = f"{safe_title}-annotated-{image_index}.jpg"
-        filepath = os.path.join(output_path, filename)
-        
-        # Save the figure
-        plt.tight_layout()
-        plt.savefig(filepath, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Generated annotated image: {filepath}")
-        return filepath
-    
-    except Exception as e:
-        print(f"Error generating annotated image: {str(e)}")
-        return None
-
-def generate_review_scene(product_image: Image.Image, product_details: Dict[str, Any], output_path: str, image_index: int = 1) -> Optional[str]:
-    """
-    Generate a realistic review scene showing the product being used or reviewed
-    
-    Args:
-        product_image (Image.Image): Original product image
-        product_details (Dict[str, Any]): Product details
-        output_path (str): Directory to save the generated image
-        image_index (int): Index of the image being processed
-        
-    Returns:
-        Optional[str]: Path to the generated image or None if generation failed
-    """
-    try:
-        # Configure OpenAI client
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        
-        # Convert image to base64
-        buffered = BytesIO()
-        product_image.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        
-        # Get product information for context
-        product_title = product_details.get("title", "Unknown Product")
-        product_brand = product_details.get("brand", "Unknown Brand")
-        product_category = product_details.get("categories", [])[0] if product_details.get("categories") else "product"
-        
-        # Determine appropriate background based on product category
-        background_setting = "studio setup with neutral background"
-        
-        # Customize background based on product type
-        if any(keyword in product_title.lower() for keyword in ["mouse", "keyboard", "headset", "gaming"]):
-            background_setting = "professional gaming setup with RGB lighting and gaming monitors"
-        elif any(keyword in product_title.lower() for keyword in ["phone", "smartphone", "mobile"]):
-            background_setting = "modern desk with minimal design"
-        elif any(keyword in product_title.lower() for keyword in ["laptop", "computer", "pc"]):
-            background_setting = "clean workspace with desk and computer peripherals"
-        elif any(keyword in product_title.lower() for keyword in ["camera", "lens", "photo"]):
-            background_setting = "photography studio with lighting equipment"
-        elif any(keyword in product_title.lower() for keyword in ["watch", "jewelry"]):
-            background_setting = "elegant display with soft lighting"
-        elif any(keyword in product_title.lower() for keyword in ["shoe", "sneaker", "footwear"]):
-            background_setting = "shoe display with wooden floor"
-        elif any(keyword in product_title.lower() for keyword in ["kitchen", "cookware", "appliance"]):
-            background_setting = "modern kitchen countertop"
-        
-        # Create prompt for image generation
-        prompt = f"""Create a photorealistic product showcase image of this {product_category}: {product_title} by {product_brand}. 
-        
-Show the product from a different angle in a {background_setting}. DO NOT include any human faces or people in the image. 
-        
-The scene should look like a professional product photography setup with excellent lighting to highlight the product features. Make sure the product is clearly visible and is the main focus of the image.
-        
-The image should be clean, minimalist, and suitable for a professional product review."""
-        
-        print("Generating professional product showcase with DALL-E...")
-        
-        # Generate image with DALL-E
-        response = client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            n=1,
-            size="1024x1024",
-            quality="standard"
-        )
-        
-        # Get the image URL from the response
-        image_url = response.data[0].url
-        
-        # Download the generated image
-        response = requests.get(image_url, stream=True)
-        if response.status_code == 200:
-            # Save the image
-            safe_title = re.sub(r'[^\w\s-]', '', product_details.get("title", "product"))
-            safe_title = re.sub(r'[-\s]+', '-', safe_title).strip('-').lower()
-            filename = f"{safe_title}-product-showcase-{image_index}.jpg"
-            filepath = os.path.join(output_path, filename)
-            
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-            
-            print(f"Generated professional product showcase: {filepath}")
-            return filepath
+                return None
         else:
-            print(f"Failed to download generated image: HTTP {response.status_code}")
-            return None
-    
+            with open(image_path, "rb") as image_file:
+                image_data = image_file.read()
+                
+        return base64.b64encode(image_data).decode('utf-8')
     except Exception as e:
-        print(f"Error generating product showcase: {str(e)}")
+        print(f"Error encoding image: {str(e)}")
         return None
 
-def generate_product_video(product_details: Dict[str, Any], review: Dict[str, Any], 
-                          duration: int = 60, with_voiceover: bool = False,
-                          output_dir: str = "output") -> Optional[str]:
+
+def generate_product_demo_script(product_details: Dict[str, Any]) -> str:
     """
-    Generate a video review of the product
+    Generate a product demo video script using OpenAI
     
     Args:
         product_details (Dict[str, Any]): Product details dictionary
-        review (Dict[str, Any]): Generated review content
-        duration (int): Duration of the video in seconds
-        with_voiceover (bool): Whether to add AI-generated voiceover
-        output_dir (str): Directory to save the generated video
         
     Returns:
-        Optional[str]: Path to the generated video or None if generation failed
+        str: Generated script for the product demo video
     """
-    if not OPENAI_API_KEY:
-        print("Error: OpenAI API key is required for video generation. Set the OPENAI_API_KEY environment variable.")
-        return None
-        
-    try:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate a script for the video based on the review
-        print("Generating video script...")
-        script = generate_video_script(review, duration)
-        
-        # If voiceover is requested, generate audio narration
-        audio_path = None
-        if with_voiceover:
-            print("Generating voiceover...")
-            audio_path = generate_voiceover(script, output_dir)
-        
-        # Collect images for the video
-        print("Collecting images for video...")
-        image_paths = []
-        
-        # Use product images if available
-        if product_details.get("image_urls"):
-            # First check if we already have processed images
-            existing_images = [f for f in os.listdir(output_dir) if f.startswith("product_") and f.endswith(".png")]
-            
-            if existing_images:
-                image_paths = [os.path.join(output_dir, img) for img in existing_images]
-            else:
-                # Process images if we haven't already
-                image_paths = process_product_images(product_details, output_dir)
-        
-        # If we don't have enough images, generate some additional ones
-        if len(image_paths) < 3:
-            print("Generating additional product images...")
-            for i in range(3 - len(image_paths)):
-                # Download the first product image if available
-                if product_details.get("image_urls") and len(product_details["image_urls"]) > 0:
-                    base_image = download_image(product_details["image_urls"][0])
-                    if base_image:
-                        # Generate a review scene with the product
-                        scene_path = generate_review_scene(base_image, product_details, output_dir, i+1)
-                        if scene_path:
-                            image_paths.append(scene_path)
-        
-        # Create the video from images and audio
-        print(f"Creating {duration} second video...")
-        video_path = create_video_from_images(image_paths, script, audio_path, duration, output_dir)
-        
-        return video_path
+    # Prepare the product information for the prompt
+    product_info = {
+        "title": product_details.get("title", "Unknown Product"),
+        "description": product_details.get("description", ""),
+        "features": product_details.get("features", []),
+        "specifications": product_details.get("specifications", {}),
+        "price": f"{product_details.get('currency', '$')}{product_details.get('price', 'N/A')}",
+        "rating": product_details.get("rating", "N/A"),
+        "brand": product_details.get("brand", "Unknown Brand")
+    }
     
-    except Exception as e:
-        print(f"Error generating video: {str(e)}")
-        return None
-
-def generate_video_script(review: Dict[str, Any], duration: int = 60) -> str:
-    """
-    Generate a script for the video based on the review
+    logger.info(f"Generating product demo script for: {product_info['title']}")
     
-    Args:
-        review (Dict[str, Any]): Generated review content
-        duration (int): Target duration of the video in seconds
-        
-    Returns:
-        str: Script for the video
-    """
-    content = review["content"]
-    product_title = review["product_title"]
+    # Create a prompt for OpenAI
+    prompt = f"""
+    You are a professional product marketing specialist. Analyze the following product information and create a compelling 30-40 second product demo video script.
     
-    # Calculate approximate word count based on speaking rate (150 words per minute)
-    target_word_count = (duration / 60) * 150
+    PRODUCT INFORMATION:
+    Title: {product_info['title']}
+    Brand: {product_info['brand']}
+    Price: {product_info['price']}
+    Rating: {product_info['rating']}
     
-    # Create a prompt for OpenAI to generate a script
-    prompt = f"""Create a concise {duration}-second video script for a product review of '{product_title}'.
-    The script should be approximately {int(target_word_count)} words and cover these key points:
+    Description:
+    {product_info['description']}
     
-    Introduction: {content.get('introduction', 'Brief introduction to the product')}
+    Key Features:
+    {', '.join(product_info['features']) if product_info['features'] else 'No features listed'}
     
-    Pros: {content.get('pros', 'Main advantages of the product')}
+    Specifications:
+    {json.dumps(product_info['specifications'], indent=2)}
     
-    Cons: {content.get('cons', 'Main disadvantages of the product')}
-    
-    Verdict: {content.get('verdict', 'Final verdict on the product')}
-    
-    Format the script as a continuous paragraph that flows naturally when spoken.
+    Create a script that highlights the product's key benefits, features, and use cases. The script should be engaging, informative, and persuasive.
+    Structure the script with clear sections, including an introduction, key features, benefits, and a call to action.
+    The script should be approximately 30-40 seconds when read aloud at a normal pace.
     """
     
     try:
-        # Call OpenAI API to generate the script
-        openai.api_key = OPENAI_API_KEY
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
+        logger.info("Sending request to OpenAI for script generation")
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a professional product reviewer who creates engaging video scripts."},
+                {"role": "system", "content": "You are a professional product marketing specialist who creates compelling product demo scripts."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=1000,
@@ -1009,172 +327,368 @@ def generate_video_script(review: Dict[str, Any], duration: int = 60) -> str:
         )
         
         script = response.choices[0].message.content.strip()
+        logger.info(f"Generated script ({len(script)} chars):\n{script}\n")
         return script
-    
     except Exception as e:
-        print(f"Error generating video script: {str(e)}")
-        # Fallback to a simple script based on the review content
-        script_parts = []
-        
-        if content.get("introduction"):
-            script_parts.append(content["introduction"])
-        
-        if content.get("pros"):
-            script_parts.append("The main advantages of this product are: " + content["pros"])
-        
-        if content.get("cons"):
-            script_parts.append("However, there are some drawbacks: " + content["cons"])
-        
-        if content.get("verdict"):
-            script_parts.append("In conclusion: " + content["verdict"])
-        
-        return " ".join(script_parts)
+        error_msg = f"Error generating product demo script: {str(e)}"
+        logger.error(error_msg)
+        return f"Failed to generate script: {str(e)}"
 
-def generate_voiceover(script: str, output_dir: str) -> Optional[str]:
+
+def generate_creative_prompts(script: str, image_url: str) -> Dict[str, Any]:
     """
-    Generate an AI voiceover for the video script
+    Generate creative prompts for image and video content based on the script and source image
     
     Args:
-        script (str): The video script
-        output_dir (str): Directory to save the audio file
+        script (str): The product demo script
+        image_url (str): URL of the product image
         
     Returns:
-        Optional[str]: Path to the generated audio file or None if generation failed
+        Dict[str, Any]: Dictionary containing image prompt, video prompt, and image URL
     """
-    try:
-        # For now, print a message that this would use an API like ElevenLabs or similar
-        print("Note: This would use a Text-to-Speech API to generate a voiceover")
-        print(f"Script for voiceover ({len(script.split())} words):\n{script[:100]}...")
-        
-        # Create a placeholder audio file path
-        audio_path = os.path.join(output_dir, "voiceover.mp3")
-        
-        # In a real implementation, you would call a TTS API here
-        # For now, we'll just return the path as if it was created
-        
-        return audio_path
+    logger.info(f"Generating creative prompts for image: {image_url}")
     
+    # Encode the image to base64 if it's a URL
+    image_base64 = encode_image_to_base64(image_url)
+    
+    if not image_base64:
+        error_msg = "Failed to encode image to base64"
+        logger.error(error_msg)
+        return {
+            "error": "Failed to encode image",
+            "img_prompt": "",
+            "video_prompt": "",
+            "img_url": image_url
+        }
+    
+    # Parse the script to extract scenes
+    scenes = extract_scenes_from_script(script)
+    
+    # Create a prompt for OpenAI
+    prompt = f"""
+    You are tasked with generating creative prompts for both image and video content based on a provided script and source images. Follow the instructions below:
+
+    The script has been divided into the following scenes:
+    {json.dumps(scenes, indent=2)}
+    
+    For each scene, create:
+    1. An image prompt that captures the essence of that scene using the provided product image
+    2. A video prompt that describes how to animate that scene
+    
+    Image Prompt Objective:
+    Generate an image prompt for each scene based on the existing product image. The output image should be visually compelling and designed to match the scene's content. Ensure the image aligns with the narrative or mood of the provided script scene.
+
+    Video Prompt Objective:
+    Using the image prompt and the product image, write a corresponding video prompt that describes how the image could be brought to life through motion (e.g., camera panning, lighting changes, environmental motion). The video prompt should be based on the same theme or story as the script scene.
+
+    Human Interaction Rule:
+    You may include human figures and interactions in the image or video concepts, but faces must not be visible. Use poses, silhouettes, or over-the-shoulder angles to preserve anonymity.
+
+    PRODUCT IMAGE URL:
+    {image_url}
+    
+    Respond in JSON format with the following structure:
+    {{
+      "scenes": [
+        {{
+          "scene_name": "Scene name/number",
+          "scene_content": "Original scene content",
+          "img_prompt": "The prompt for generating an enhanced product image for this scene",
+          "video_prompt": "The prompt for animating this scene into a video"
+        }},
+        // Additional scenes...
+      ]
+    }}
+    """
+    
+    logger.info("Sending request to OpenAI for creative prompts generation")
+    
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are a creative director specializing in product marketing visuals. You create compelling image and video prompts based on product scripts and images."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1500,
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        # Parse the JSON response
+        result_text = response.choices[0].message.content
+        logger.info(f"Generated creative prompts:\n{result_text}\n")
+        
+        result = json.loads(result_text)
+        
+        # Add the original image URL to each scene
+        if "scenes" in result:
+            for scene in result["scenes"]:
+                scene["img_url"] = image_url
+        
+        # Add the original image URL to the top level for backward compatibility
+        result["img_url"] = image_url
+        
+        return result
     except Exception as e:
-        print(f"Error generating voiceover: {str(e)}")
+        error_msg = f"Error generating creative prompts: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "error": f"Failed to generate prompts: {str(e)}",
+            "img_prompt": "",
+            "video_prompt": "",
+            "img_url": image_url
+        }
+
+
+def extract_scenes_from_script(script: str) -> List[Dict[str, str]]:
+    """
+    Extract scenes from a script based on section markers
+    
+    Args:
+        script (str): The product demo script
+        
+    Returns:
+        List[Dict[str, str]]: List of scenes with name and content
+    """
+    # Look for scene markers like [INTRO], [KEY FEATURES], etc.
+    scene_pattern = r'\*\*\[(.*?)\].*?\*\*\s*(.*?)(?=\*\*\[|$)'  # Matches **[SCENE_NAME]** and content until next scene or end
+    scenes = []
+    
+    # Try to find scenes with the pattern
+    matches = re.findall(scene_pattern, script, re.DOTALL)
+    
+    if matches:
+        for i, (scene_name, scene_content) in enumerate(matches):
+            scenes.append({
+                "scene_number": i + 1,
+                "scene_name": scene_name.strip(),
+                "scene_content": scene_content.strip()
+            })
+    else:
+        # If no scenes found, split by paragraphs or use the whole script as one scene
+        paragraphs = script.split('\n\n')
+        if len(paragraphs) > 1:
+            for i, paragraph in enumerate(paragraphs):
+                if paragraph.strip():
+                    scenes.append({
+                        "scene_number": i + 1,
+                        "scene_name": f"Scene {i+1}",
+                        "scene_content": paragraph.strip()
+                    })
+        else:
+            scenes.append({
+                "scene_number": 1,
+                "scene_name": "Main Scene",
+                "scene_content": script.strip()
+            })
+    
+    return scenes
+
+
+def generate_enhanced_image(img_prompt: str, reference_image_url: str, output_dir: str = "output") -> Optional[str]:
+    """
+    Generate an enhanced image based on the prompt and reference image
+    
+    Args:
+        img_prompt (str): The image generation prompt
+        reference_image_url (str): URL of the reference image
+        output_dir (str): Directory to save the generated image
+        
+    Returns:
+        Optional[str]: Path to the generated image or None if generation failed
+    """
+    logger.info(f"Generating enhanced image using prompt: {img_prompt[:100]}...")
+    
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Download the reference image directly
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(reference_image_url, headers=headers, stream=True, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to download reference image: HTTP {response.status_code}")
+            return None
+            
+        # Save the image to a temporary file
+        temp_image_path = os.path.join(output_dir, f"temp_reference_{uuid.uuid4()}.png")
+        img = Image.open(BytesIO(response.content))
+        img.save(temp_image_path, format="PNG")
+        logger.info(f"Saved reference image to temporary file: {temp_image_path}")
+        
+        # Generate a new image using OpenAI's API
+        logger.info("Generating new image with DALL-E")
+        
+        # Use generate instead of edit since edit is having format issues
+        with open(temp_image_path, "rb") as img_file:
+            response = openai.images.generate(
+                model="dall-e-2",
+                prompt=f"Based on this product image, create an enhanced version that: {img_prompt}. Keep the original product shape and design unchanged.",
+                n=1,
+                size="1024x1024"
+            )
+        
+        # Get the image URL from the response
+        image_url = response.data[0].url
+        logger.info(f"Generated image URL: {image_url}")
+        
+        # Download the generated image
+        image_response = requests.get(image_url)
+        if image_response.status_code == 200:
+            # Generate a unique filename
+            filename = f"{uuid.uuid4()}.png"
+            output_path = os.path.join(output_dir, filename)
+            
+            # Save the image
+            with open(output_path, "wb") as f:
+                f.write(image_response.content)
+            
+            logger.info(f"Saved generated image to: {output_path}")
+            
+            # Clean up temporary file
+            try:
+                os.remove(temp_image_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary file: {e}")
+                
+            return output_path
+        else:
+            logger.error(f"Failed to download generated image: HTTP {image_response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Error generating enhanced image: {str(e)}")
         return None
 
-def create_video_from_images(image_paths: List[str], script: str, audio_path: Optional[str], 
-                            duration: int, output_dir: str) -> Optional[str]:
-    """
-    Create a video from a collection of images and optional audio
-    
-    Args:
-        image_paths (List[str]): Paths to the images to include in the video
-        script (str): The video script (used for captions if no audio)
-        audio_path (Optional[str]): Path to the voiceover audio file
-        duration (int): Duration of the video in seconds
-        output_dir (str): Directory to save the video
-        
-    Returns:
-        Optional[str]: Path to the generated video or None if generation failed
-    """
-    try:
-        # For now, print a message that this would use a library like MoviePy
-        print("Note: This would use MoviePy or a similar library to create the video")
-        print(f"Creating video with {len(image_paths)} images over {duration} seconds")
-        
-        # Create a placeholder video file path
-        video_filename = f"product_review_{int(time.time())}.mp4"
-        video_path = os.path.join(output_dir, video_filename)
-        
-        # In a real implementation, you would use MoviePy or similar to create the video
-        # For now, we'll just return the path as if it was created
-        
-        # Create an empty file as a placeholder
-        with open(video_path, 'w') as f:
-            f.write(f"This is a placeholder for a {duration}-second product review video")
-            f.write(f"\nIt would include {len(image_paths)} images and")
-            f.write(f"\n{'a voiceover' if audio_path else 'captions'}")
-        
-        return video_path
-    
-    except Exception as e:
-        print(f"Error creating video: {str(e)}")
-        return None
 
-def format_output(review: Dict[str, Any], format_json: bool = False) -> str:
+def process_product(url: str, output_dir: str = "output") -> Dict[str, Any]:
     """
-    Format the review output for terminal display
+    Process a product URL to generate enhanced content
     
     Args:
-        review (dict): Review data
-        format_json (bool): Whether to output as JSON
+        url (str): Amazon product URL
+        output_dir (str): Directory to save generated content
         
     Returns:
-        str: Formatted output string
+        Dict[str, Any]: Results of the processing
     """
-    if format_json:
-        return json.dumps(review, indent=2, ensure_ascii=False)
+    logger.info(f"Starting to process product URL: {url}")
+    results = {
+        "product_details": None,
+        "demo_script": None,
+        "creative_prompts": None,
+        "generated_images": []
+    }
     
-    if "error" in review:
-        return f"\nERROR: {review['error']}"
+    # Step 1: Fetch product details using the more reliable bs4scrape function
+    logger.info("Step 1: Fetching product details...")
+    bs4_product_data = bs4_get_amazon_product_details(url)
     
-    output = []
-    output.append("\n" + "="*80)
-    output.append(f"AUTOMATED REVIEW: {review['product_title']}")
-    output.append(f"Type: {review['review_type'].capitalize()} Review")
-    output.append(f"Generated: {review['generated_at']}")
-    output.append("="*80)
+    if "error" in bs4_product_data:
+        error_msg = f"Error fetching product details: {bs4_product_data['error']}"
+        logger.error(error_msg)
+        results["error"] = bs4_product_data["error"]
+        return results
     
-    content = review["content"]
+    # Convert bs4scrape format to our internal format
+    product_details = {
+        "title": bs4_product_data.get("title"),
+        "price": bs4_product_data.get("price"),
+        "currency": bs4_product_data.get("price", "$")[0] if bs4_product_data.get("price") else "$",
+        "description": bs4_product_data.get("product_description", ""),
+        "features": [],  # Will be populated from description if available
+        "specifications": bs4_product_data.get("product_details", {}),
+        "rating": bs4_product_data.get("rating"),
+        "review_count": bs4_product_data.get("number_of_reviews"),
+        "image_urls": bs4_product_data.get("images", []),
+        "availability": bs4_product_data.get("availability"),
+        "brand": bs4_product_data.get("brand"),
+        "categories": [],
+        "url": url
+    }
     
-    # Introduction
-    if "introduction" in content:
-        output.append("\nINTRODUCTION:")
-        output.append("-"*80)
-        output.append(content["introduction"])
+    # Extract features from description if available
+    if product_details["description"]:
+        # Try to extract bullet points or key features from description
+        features = re.findall(r'[•\*\-]\s*([^\n]+)', product_details["description"])
+        if features:
+            product_details["features"] = features
     
-    # Pros
-    if "pros" in content:
-        output.append("\nPROS:")
-        output.append("-"*80)
-        output.append(content["pros"])
+    logger.info(f"Successfully fetched details for product: {product_details.get('title', 'Unknown')}")
+    logger.info(f"Found {len(product_details['image_urls'])} product images")
+    results["product_details"] = product_details
     
-    # Cons
-    if "cons" in content:
-        output.append("\nCONS:")
-        output.append("-"*80)
-        output.append(content["cons"])
+    # Step 2: Generate product demo script
+    logger.info("Step 2: Generating product demo script...")
+    demo_script = generate_product_demo_script(product_details)
+    results["demo_script"] = demo_script
     
-    # Verdict
-    if "verdict" in content:
-        output.append("\nVERDICT:")
-        output.append("-"*80)
-        output.append(content["verdict"])
+    # Step 3: Generate creative prompts for each image
+    logger.info("Step 3: Generating creative prompts...")
+    creative_prompts_list = []
     
-    # Rating
-    if "rating" in content:
-        output.append(f"\nRATING: {content['rating']}/10")
+    # Use only the first image for simplicity, or loop through all images if needed
+    if product_details.get("image_urls"):
+        for i, image_url in enumerate(product_details["image_urls"][:1]):  # Limit to first image for now
+            logger.info(f"Processing image {i+1}/{len(product_details['image_urls'][:1])}: {image_url}")
+            creative_prompts = generate_creative_prompts(demo_script, image_url)
+            creative_prompts_list.append(creative_prompts)
+    else:
+        logger.warning("No product images found in the product details")
     
-    # Full text (for debugging)
-    # output.append("\nFULL TEXT:")
-    # output.append("-"*80)
-    # output.append(content["full_text"])
+    results["creative_prompts"] = creative_prompts_list
     
-    return "\n".join(output)
+    # Step 4: Generate enhanced images
+    logger.info("Step 4: Generating enhanced images...")
+    for i, prompts in enumerate(creative_prompts_list):
+        if "error" not in prompts:
+            logger.info(f"Generating enhanced image {i+1}/{len(creative_prompts_list)}...")
+            for scene in prompts["scenes"]:
+                img_path = generate_enhanced_image(
+                    scene["img_prompt"],
+                    prompts["img_url"],
+                    output_dir
+                )
+                if img_path:
+                    logger.info(f"Successfully generated enhanced image: {img_path}")
+                    results["generated_images"].append({
+                        "original_image": prompts["img_url"],
+                        "enhanced_image": img_path,
+                        "img_prompt": scene["img_prompt"],
+                        "video_prompt": scene["video_prompt"]
+                    })
+                else:
+                    logger.error(f"Failed to generate enhanced image for prompt {i+1}")
+        else:
+            logger.error(f"Skipping image generation due to error in prompts: {prompts.get('error', 'Unknown error')}")
+    
+    logger.info("Product processing complete")
+    return results
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract product details and generate automated reviews from Amazon URLs')
+    parser = argparse.ArgumentParser(description='Extract product details and generate enhanced content from Amazon URLs')
     parser.add_argument('url', help='Amazon product URL')
-    parser.add_argument('--output', '-o', help='Output file path (JSON format)')
-    parser.add_argument('--json', '-j', action='store_true', help='Display output as JSON')
-    parser.add_argument('--review-type', '-t', choices=['detailed', 'summary', 'comparison'], 
-                        default='detailed', help='Type of review to generate')
-    parser.add_argument('--generate-image', '-i', action='store_true', 
-                        help='Generate annotated product image with feature highlights')
-    parser.add_argument('--image-output-dir', '-d', default='output',
-                        help='Directory to save generated images (default: "output")')
-    parser.add_argument('--generate-video', '-v', action='store_true',
-                        help='Generate video review of the product')
-    parser.add_argument('--video-duration', type=int, default=60,
-                        help='Duration of the generated video in seconds (default: 60)')
-    parser.add_argument('--with-voiceover', action='store_true',
-                        help='Add AI-generated voiceover to the video')
+    parser.add_argument('--output', '-o', help='Output directory for generated content', default='output')
+    parser.add_argument('--json-output', '-j', help='Output file path for JSON results', default=None)
+    parser.add_argument('--verbose', '-v', action='store_true', help='Display detailed information including prompts')
     args = parser.parse_args()
     
     # Validate URL - check for both amazon.com and shortened amzn links
@@ -1182,45 +696,76 @@ def main():
         print("Error: The URL doesn't appear to be from Amazon.")
         sys.exit(1)
     
-    # Fetch product details
-    product_details = fetch_amazon_product_details(args.url)
+    # Process the product
+    results = process_product(args.url, args.output)
     
-    if "error" in product_details:
-        print(f"Error: {product_details['error']}")
-        sys.exit(1)
+    # Print a summary of the results
+    print("\n" + "=" * 80)
+    print(f"PRODUCT: {results.get('product_details', {}).get('title', 'Unknown')}")
+    print("=" * 80)
     
-    # Generate review
-    print(f"Generating {args.review_type} review...")
-    review = generate_product_review(product_details, args.review_type)
+    # Print script
+    print("\nGENERATED SCRIPT:")
+    print("-" * 80)
+    script = results.get('demo_script', '')
+    print(f"{script[:300]}..." if len(script) > 300 else script)
+    print(f"\nTotal script length: {len(script)} characters")
     
-    # Display results
-    print(format_output(review, args.json))
+    # Print creative prompts
+    if args.verbose:
+        print("\nCREATIVE PROMPTS:")
+        print("-" * 80)
+        for i, prompts in enumerate(results.get('creative_prompts', [])):
+            print(f"\nPrompt Set #{i+1}:")
+            if 'error' in prompts:
+                print(f"Error: {prompts['error']}")
+            else:
+                for scene in prompts["scenes"]:
+                    print(f"\nScene: {scene['scene_name']}")
+                    print(f"Image Prompt:\n{scene.get('img_prompt', 'None')}")
+                    print(f"Video Prompt:\n{scene.get('video_prompt', 'None')}")
+                    print(f"Reference Image URL: {prompts.get('img_url', 'None')}")
+    else:
+        print(f"\nCreative prompts generated: {len(results.get('creative_prompts', []))}")
     
-    # Save to file if specified
-    if args.output:
+    # Print generated images
+    print("\nGENERATED IMAGES:")
+    print("-" * 80)
+    if results.get("generated_images"):
+        for i, img_data in enumerate(results["generated_images"]):
+            print(f"  {i+1}. {img_data['enhanced_image']}")
+            if args.verbose:
+                print(f"     Original: {img_data['original_image']}")
+                print(f"     Prompt: {img_data['img_prompt'][:100]}..." if len(img_data['img_prompt']) > 100 else img_data['img_prompt'])
+    else:
+        print("  No images were generated.")
+    
+    # Save results to JSON file if specified
+    if args.json_output:
         try:
-            with open(args.output, 'w', encoding='utf-8') as f:
-                json.dump(review, f, indent=2, ensure_ascii=False)
-            print(f"\nReview saved to: {args.output}")
+            # Create a serializable version of the results
+            serializable_results = {
+                "product_details": results.get("product_details"),
+                "demo_script": results.get("demo_script"),
+                "creative_prompts": results.get("creative_prompts"),
+                "generated_images": [
+                    {
+                        "original_image": img_data["original_image"],
+                        "enhanced_image": img_data["enhanced_image"],
+                        "img_prompt": img_data["img_prompt"],
+                        "video_prompt": img_data["video_prompt"]
+                    } for img_data in results.get("generated_images", [])
+                ]
+            }
+            
+            with open(args.json_output, 'w', encoding='utf-8') as f:
+                json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+            print(f"\nResults saved to: {args.json_output}")
         except Exception as e:
             print(f"\nError saving to file: {str(e)}")
     
-    # Process product images if requested
-    if args.generate_image and product_details.get("image_urls"):
-        print("\nProcessing product images...")
-        image_paths = process_product_images(product_details, args.image_output_dir)
-        if image_paths:
-            print(f"Generated images saved to: {args.image_output_dir}")
-    
-    # Generate video if requested
-    if args.generate_video:
-        print("\nGenerating product review video...")
-        video_path = generate_product_video(product_details, review, 
-                                          duration=args.video_duration,
-                                          with_voiceover=args.with_voiceover,
-                                          output_dir=args.image_output_dir)
-        if video_path:
-            print(f"Generated video saved to: {video_path}")
+    print("\nLog file with detailed information has been saved to: scrapeer.log")
+
 
 if __name__ == "__main__":
     try:
